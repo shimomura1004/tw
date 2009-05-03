@@ -1,0 +1,115 @@
+#!/usr/bin/python
+
+import sys, codecs
+import types
+import time
+import urllib2
+from threading import Thread
+from xml.dom.minidom import parse
+import datetime
+
+username = ""
+password = ""
+color = True
+
+def set_certification():
+  hndl = urllib2.HTTPBasicAuthHandler()
+  hndl.add_password('Twitter API', 'http://twitter.com/',
+                    username, password)
+  urllib2.install_opener(urllib2.build_opener(hndl))
+def tagText(node, tagName):
+  return node.getElementsByTagName(tagName)[0].firstChild.nodeValue
+def utc2jst(utc_in_twitter_format):
+  utc = (datetime.datetime.
+    strptime(utc_in_twitter_format, '%a %b %d %H:%M:%S +0000 %Y'))
+  td = datetime.timedelta(hours=9)
+  return (utc+td).strftime('%a %b %d %H:%M:%S')
+
+writer_is_alive = True
+
+class Reader(Thread):
+  target_url = "http://twitter.com/statuses/friends_timeline.xml"
+  last_id = 0
+  timer = 0
+
+  def __init__(self):
+    Thread.__init__(self)
+
+  def run(self):
+    set_certification()
+    req = urllib2.Request(self.target_url)
+
+    while writer_is_alive:
+      if self.timer == 0:
+        try:
+          e = parse(file=urllib2.urlopen(req))
+        except Exception, ex:
+          sys.stderr.write(str(ex) + "\n")
+        if type(e) != types.NoneType:
+          self.check_new_post(e)
+
+      self.timer = (self.timer + 1) % 60
+      time.sleep(1)
+
+  def check_new_post(self, e):
+    def print_status(screen_name, text, timestamp):
+      if color:
+        print ("\x1b[35m%s (%s)\n\x1b[39m  %s" %
+	  (text, timestamp, screen_name))
+      else:
+        print "%s (%s)\n  %s" % (text, timestamp, screen_name)
+    for status in reversed(e.getElementsByTagName('status')):
+      if self.last_id < int(tagText(status, 'id')):
+        self.last_id = int(tagText(status, 'id'))
+        screen_name = tagText(status, 'text')
+        text = tagText(status, 'screen_name')
+	timestamp = utc2jst(tagText(status, 'created_at'))
+        print_status(screen_name, text, timestamp)
+
+class Writer(Thread):
+  target_url = "http://twitter.com/statuses/update.xml"
+
+  def __init__(self):
+    Thread.__init__(self)
+
+  def run(self):
+    while True:
+      try:
+        text = unicode(raw_input().strip(), "utf-8")
+        if text.startswith("tw "):
+          self.send_new_post(text[3:])
+      except EOFError:
+        global writer_is_alive
+        writer_is_alive = False
+        break
+
+  def send_new_post(self, text):
+    r = urllib2.Request(self.target_url)
+    r.add_header("User-Agent", "TW http://d.hatena.ne.jp/zyxwv/")
+    r.add_header("X-Twitter-Client", "TW")
+    r.add_header("X-Twitter-Client-URL", "http://d.hatena.ne.jp/zyxwv/")
+    r.add_header("X-Twitter-Client-Version", "0.1")
+    r.add_data("source=TW&status="+text.encode('utf-8'))
+    try:
+      status = parse(file=urllib2.urlopen(r))
+      print "--- message was sent ---"
+    except urllib2.HTTPError, e:
+      print "--- HTTP ERROR ---", e
+    except urllib2.URLError, e:
+      print "--- URL ERROR ---", e
+
+if __name__ == '__main__':
+  if username == "" or password == "":
+    print "Error: Please specify your twitter account info"
+    sys.exit(1)
+  if "--no-color" in sys.argv:
+    color = False
+
+  sys.stdout = codecs.lookup('utf_8')[-1](sys.stdout)
+
+  reader = Reader()
+  writer = Writer()
+  reader.start()
+  writer.start()
+  reader.join()
+  writer.join()
