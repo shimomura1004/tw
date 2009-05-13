@@ -12,6 +12,8 @@ username = ""
 password = ""
 color = True
 
+hidden = ['']
+
 def set_certification():
   hndl = urllib2.HTTPBasicAuthHandler()
   hndl.add_password('Twitter API', 'http://twitter.com/',
@@ -58,13 +60,15 @@ class Reader(Thread):
 	  (text, timestamp, screen_name))
       else:
         print "%s (%s)\n  %s" % (text, timestamp, screen_name)
+
     for status in reversed(e.getElementsByTagName('status')):
       if self.last_id < int(tagText(status, 'id')):
         self.last_id = int(tagText(status, 'id'))
         screen_name = tagText(status, 'text')
         text = tagText(status, 'screen_name')
-	timestamp = utc2jst(tagText(status, 'created_at'))
-        print_status(screen_name, text, timestamp)
+        timestamp = utc2jst(tagText(status, 'created_at'))
+        if (not text in hidden) or (username in screen_name):
+          print_status(screen_name, text, timestamp)
 
 class Writer(Thread):
   target_url = "http://twitter.com/statuses/update.xml"
