@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import sys, codecs
 import types
@@ -12,7 +12,8 @@ username = ""
 password = ""
 color = True
 
-hidden = ['']
+hidden = []
+group = {"all":[], "group1":['user1','user2']}
 
 def set_certification():
   hndl = urllib2.HTTPBasicAuthHandler()
@@ -28,8 +29,11 @@ def utc2jst(utc_in_twitter_format):
   return (utc+td).strftime('%a %b %d %H:%M:%S')
 
 writer_is_alive = True
+selected_group = group["all"]
 
 class Reader(Thread):
+  log = []
+  current_group = []
   target_url = "http://twitter.com/statuses/friends_timeline.xml"
   last_id = 0
   timer = 0
@@ -38,6 +42,7 @@ class Reader(Thread):
     Thread.__init__(self)
 
   def run(self):
+    global selected_group
     set_certification()
     req = urllib2.Request(self.target_url)
 
@@ -50,25 +55,38 @@ class Reader(Thread):
         if type(e) != types.NoneType:
           self.check_new_post(e)
 
+      if selected_group != None:
+        self.current_group = selected_group
+        selected_group = None
+        self.reprint_log()
+
       self.timer = (self.timer + 1) % 60
       time.sleep(1)
 
-  def check_new_post(self, e):
-    def print_status(screen_name, text, timestamp):
+  def print_status(self, status):
+    def print_post(screen_name, text, timestamp):
       if color:
         print ("\x1b[35m%s (%s)\n\x1b[39m  %s" %
 	  (text, timestamp, screen_name))
       else:
         print "%s (%s)\n  %s" % (text, timestamp, screen_name)
 
+    screen_name = tagText(status, 'text')
+    text = tagText(status, 'screen_name')
+    timestamp = utc2jst(tagText(status, 'created_at'))
+    if (not text in hidden) or (username in screen_name):
+      if (self.current_group == []) or (text in self.current_group):
+        print_post(screen_name, text, timestamp)
+  def reprint_log(self):
+    for status in self.log:
+      self.print_status(status)
+
+  def check_new_post(self, e):
     for status in reversed(e.getElementsByTagName('status')):
       if self.last_id < int(tagText(status, 'id')):
+        self.log.append(status)
         self.last_id = int(tagText(status, 'id'))
-        screen_name = tagText(status, 'text')
-        text = tagText(status, 'screen_name')
-        timestamp = utc2jst(tagText(status, 'created_at'))
-        if (not text in hidden) or (username in screen_name):
-          print_status(screen_name, text, timestamp)
+        self.print_status(status)
 
 class Writer(Thread):
   target_url = "http://twitter.com/statuses/update.xml"
@@ -82,6 +100,10 @@ class Writer(Thread):
         text = unicode(raw_input().strip(), "utf-8")
         if text.startswith("tw "):
           self.send_new_post(text[3:])
+        if text.startswith("ch "):
+          self.change_group(text[3:])
+        if text == "ch":
+          self.change_group("all");
       except EOFError:
         global writer_is_alive
         writer_is_alive = False
@@ -102,6 +124,15 @@ class Writer(Thread):
     except urllib2.URLError, e:
       print "--- URL ERROR ---", e
 
+  def change_group(self, name):
+    try:
+      global selected_group
+      selected_group = group[name]
+      print "--- group was changed ---"
+    except IndexError, e:
+      print "--- GROUP NAME ERROR ---", e
+
+# main
 if __name__ == '__main__':
   if username == "" or password == "":
     print "Error: Please specify your twitter account info"
