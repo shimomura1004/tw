@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/opt/local/bin/python2.5
 
 import sys, codecs
 import types
@@ -10,10 +10,12 @@ import datetime
 
 username = ""
 password = ""
-color = True
+hidden = ['']
+group_predicates = {
+  "all":(lambda status: True),
+  "reply":(lambda status: "@name" in tagText(status, 'text'))
+  }
 
-hidden = []
-group = {"all":[], "group1":['user1','user2']}
 
 def set_certification():
   hndl = urllib2.HTTPBasicAuthHandler()
@@ -28,12 +30,14 @@ def utc2jst(utc_in_twitter_format):
   td = datetime.timedelta(hours=9)
   return (utc+td).strftime('%a %b %d %H:%M:%S')
 
+
+color = True
 writer_is_alive = True
-selected_group = group["all"]
+selected_group = "all"
 
 class Reader(Thread):
   log = []
-  current_group = []
+  reader_group = selected_group
   target_url = "http://twitter.com/statuses/friends_timeline.xml"
   last_id = 0
   timer = 0
@@ -55,9 +59,8 @@ class Reader(Thread):
         if type(e) != types.NoneType:
           self.check_new_post(e)
 
-      if selected_group != None:
-        self.current_group = selected_group
-        selected_group = None
+      if self.reader_group != selected_group:
+        self.reader_group = selected_group
         self.reprint_log()
 
       self.timer = (self.timer + 1) % 60
@@ -67,16 +70,17 @@ class Reader(Thread):
     def print_post(screen_name, text, timestamp):
       if color:
         print ("\x1b[35m%s (%s)\n\x1b[39m  %s" %
-	  (text, timestamp, screen_name))
+	  (screen_name, timestamp, text))
       else:
-        print "%s (%s)\n  %s" % (text, timestamp, screen_name)
+        print "%s (%s)\n  %s" % (screen_name, timestamp, text)
 
-    screen_name = tagText(status, 'text')
-    text = tagText(status, 'screen_name')
+    screen_name = tagText(status, 'screen_name')
+    text = tagText(status, 'text')
     timestamp = utc2jst(tagText(status, 'created_at'))
-    if (not text in hidden) or (username in screen_name):
-      if (self.current_group == []) or (text in self.current_group):
+    if (not screen_name in hidden) or (username in text):
+      if (group_predicates[self.reader_group](status)):
         print_post(screen_name, text, timestamp)
+
   def reprint_log(self):
     for status in self.log:
       self.print_status(status)
@@ -95,15 +99,32 @@ class Writer(Thread):
     Thread.__init__(self)
 
   def run(self):
+    global selected_group
     while True:
       try:
         text = unicode(raw_input().strip(), "utf-8")
         if text.startswith("tw "):
           self.send_new_post(text[3:])
-        if text.startswith("ch "):
-          self.change_group(text[3:])
-        if text == "ch":
-          self.change_group("all");
+
+        elif text == "ch":
+          selected_group = "all"
+          print "--- group was changed (all) ---"
+        elif text.startswith("ch "):
+          new_group = None
+          keys = group_predicates.keys()
+          if text[3:] in keys:
+            new_group = text[3:]
+          else :
+            for key in keys:
+              if key.startswith(text[3:]):
+                new_group = key
+                break
+          if new_group != None:
+            selected_group = new_group
+            print "--- group was changed (%s) ---" % new_group
+          else:
+            print "--- GROUP ERROR (%s) ---" % text[3:]
+
       except EOFError:
         global writer_is_alive
         writer_is_alive = False
@@ -124,13 +145,6 @@ class Writer(Thread):
     except urllib2.URLError, e:
       print "--- URL ERROR ---", e
 
-  def change_group(self, name):
-    try:
-      global selected_group
-      selected_group = group[name]
-      print "--- group was changed ---"
-    except IndexError, e:
-      print "--- GROUP NAME ERROR ---", e
 
 # main
 if __name__ == '__main__':
