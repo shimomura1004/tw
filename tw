@@ -93,13 +93,13 @@ class Reader(Thread):
         self.print_status(status)
 
 class Writer(Thread):
-  global selected_group
   target_url = "http://twitter.com/statuses/update.xml"
 
   def __init__(self):
     Thread.__init__(self)
 
   def run(self):
+    global selected_group
     while True:
       try:
         text = unicode(raw_input().strip(), "utf-8")
