@@ -1,4 +1,4 @@
-#!/opt/local/bin/python2.5
+#!/usr/local/bin/python2.5
 
 import sys, codecs
 import types
@@ -13,7 +13,7 @@ password = ""
 hidden = ['']
 group_predicates = {
   "all":(lambda status: True),
-  "reply":(lambda status: "@name" in tagText(status, 'text'))
+  "reply":(lambda status: "@yourname" in tagText(status, 'text'))
   }
 
 
@@ -93,13 +93,13 @@ class Reader(Thread):
         self.print_status(status)
 
 class Writer(Thread):
+  global selected_group
   target_url = "http://twitter.com/statuses/update.xml"
 
   def __init__(self):
     Thread.__init__(self)
 
   def run(self):
-    global selected_group
     while True:
       try:
         text = unicode(raw_input().strip(), "utf-8")
@@ -124,6 +124,9 @@ class Writer(Thread):
             print "--- group was changed (%s) ---" % new_group
           else:
             print "--- GROUP ERROR (%s) ---" % text[3:]
+
+        elif text == "q":
+          raise EOFError
 
       except EOFError:
         global writer_is_alive
