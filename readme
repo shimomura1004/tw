@@ -4,7 +4,11 @@
 * username : your account name
 * password : your password
 * hidden : list of names that you don't wnat to watch his/her posts :)
-* group_predicates : set of predicates that define 'group'
+* group_predicates : set of predicates that define 'group'    
+    These predicates take 'status' and should return boolean value.
+    'status' is a XML data. For more information, see:
+       http://apiwiki.twitter.com/Twitter-REST-API-Method%3A-statuses-friends_timeline
+
     For example, if you want a group that contains all the posts, add
       "all":(lambda status: True)
     to the set 'group_predicates'.
@@ -16,6 +20,8 @@
     'tw (YOUR TWEET HERE)'
 * To change the group you see:
     'ch (GROUP NAME)'
+* To change your account:
+    'ac (account number)'
 * To quit:
     'q'
 
