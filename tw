@@ -1,4 +1,4 @@
-#!/usr/local/bin/python2.5
+#!/usr/bin/python
 
 import sys, codecs
 import types
@@ -8,59 +8,92 @@ from threading import Thread
 from xml.dom.minidom import parse
 import datetime
 
-username = ""
-password = ""
-hidden = ['']
-group_predicates = {
-  "all":(lambda status: True),
-  "reply":(lambda status: "@yourname" in tagText(status, 'text'))
-  }
+class Account:
+  def __init__(self, username, password, hidden, group_predicates):
+    self.username = username
+    self.password = password
+    self.hidden = hidden
+    self.group_predicates = group_predicates
+    self.current_group = "all"
+    self.last_id = 0
+    self.hndl = None
+    self.req = None
+    self.log = []
 
+accounts = [
+  Account("(username)","(password)", ["(hidden)"], {
+      "all":(lambda status: True),
+      "reply":(lambda status: "(username)" in tagText(status, 'text'))
+      }),
+  Account("(username2)", "(password2)", [], {
+      "all":(lambda status: True)
+      })]
+
+def prepare_certification():
+  for acc in accounts:
+    hndl = urllib2.HTTPBasicAuthHandler()
+    hndl.add_password('Twitter API', 'http://twitter.com/',
+                      acc.username, acc.password)
+    acc.hndl = hndl
 
 def set_certification():
-  hndl = urllib2.HTTPBasicAuthHandler()
-  hndl.add_password('Twitter API', 'http://twitter.com/',
-                    username, password)
-  urllib2.install_opener(urllib2.build_opener(hndl))
+  target_url = "http://twitter.com/statuses/friends_timeline.xml"
+  urllib2.install_opener(urllib2.build_opener(current_account.hndl))
+  current_account.req = urllib2.Request(target_url)
+
 def tagText(node, tagName):
   return node.getElementsByTagName(tagName)[0].firstChild.nodeValue
+
 def utc2jst(utc_in_twitter_format):
   utc = (datetime.datetime.
     strptime(utc_in_twitter_format, '%a %b %d %H:%M:%S +0000 %Y'))
   td = datetime.timedelta(hours=9)
   return (utc+td).strftime('%a %b %d %H:%M:%S')
 
+def changeAccount(idx):
+  global account_changed
+  global current_account
+  if idx < len(accounts):
+    account_changed = True
+    current_account = accounts[idx]
+
 
 color = True
 writer_is_alive = True
-selected_group = "all"
+account_changed = False
+group_changed = False
+
+current_account = accounts[0]
 
 class Reader(Thread):
-  log = []
-  reader_group = selected_group
   target_url = "http://twitter.com/statuses/friends_timeline.xml"
-  last_id = 0
   timer = 0
 
   def __init__(self):
     Thread.__init__(self)
-
+  def getTwits(self):
+    try:
+      e = parse(file=urllib2.urlopen(current_account.req))
+      self.check_new_post(e)
+    except Exception, ex:
+      print ex
+    
   def run(self):
-    global selected_group
-    set_certification()
-    req = urllib2.Request(self.target_url)
+    global account_changed
+    global group_changed
 
     while writer_is_alive:
       if self.timer == 0:
-        try:
-          e = parse(file=urllib2.urlopen(req))
-        except Exception, ex:
-          sys.stderr.write(str(ex) + "\n")
-        if type(e) != types.NoneType:
-          self.check_new_post(e)
+        self.getTwits();
 
-      if self.reader_group != selected_group:
-        self.reader_group = selected_group
+      # if account was changed
+      if account_changed:
+        account_changed = False
+        self.getTwits()
+        self.reprint_log()
+      # if group was changed
+      elif group_changed:
+        group_changed = False
         self.reprint_log()
 
       self.timer = (self.timer + 1) % 60
@@ -77,19 +110,21 @@ class Reader(Thread):
     screen_name = tagText(status, 'screen_name')
     text = tagText(status, 'text')
     timestamp = utc2jst(tagText(status, 'created_at'))
-    if (not screen_name in hidden) or (username in text):
-      if (group_predicates[self.reader_group](status)):
+    if ((not screen_name in current_account.hidden) or
+        (current_account.username in text)):
+      if (current_account.group_predicates[
+          current_account.current_group](status)):
         print_post(screen_name, text, timestamp)
 
   def reprint_log(self):
-    for status in self.log:
+    for status in current_account.log:
       self.print_status(status)
 
   def check_new_post(self, e):
     for status in reversed(e.getElementsByTagName('status')):
-      if self.last_id < int(tagText(status, 'id')):
-        self.log.append(status)
-        self.last_id = int(tagText(status, 'id'))
+      if current_account.last_id < int(tagText(status, 'id')):
+        current_account.log.append(status)
+        current_account.last_id = int(tagText(status, 'id'))
         self.print_status(status)
 
 class Writer(Thread):
@@ -99,19 +134,35 @@ class Writer(Thread):
     Thread.__init__(self)
 
   def run(self):
-    global selected_group
+    global group_changed
+
     while True:
       try:
         text = unicode(raw_input().strip(), "utf-8")
         if text.startswith("tw "):
           self.send_new_post(text[3:])
 
+        # change account
+        elif text == "ac":
+          changeAccount(0)
+          set_certification()
+          print "--- account was changed (default) ---"
+        elif text.startswith("ac "):
+          try:
+            changeAccount(int(text[3:]))
+            set_certification()
+            print "--- account was changed (%d) ---" %  int(text[3:])
+          except ValueError:
+            print "--- ACCOUNT ERROR (%s) ---" % text[3:]
+            
+        # change group
         elif text == "ch":
-          selected_group = "all"
+          group_changed = True
+          current_account.current_group = "all"
           print "--- group was changed (all) ---"
         elif text.startswith("ch "):
           new_group = None
-          keys = group_predicates.keys()
+          keys = current_account.group_predicates.keys()
           if text[3:] in keys:
             new_group = text[3:]
           else :
@@ -120,7 +171,8 @@ class Writer(Thread):
                 new_group = key
                 break
           if new_group != None:
-            selected_group = new_group
+            group_changed = True
+            current_account.current_group = new_group
             print "--- group was changed (%s) ---" % new_group
           else:
             print "--- GROUP ERROR (%s) ---" % text[3:]
@@ -149,15 +201,17 @@ class Writer(Thread):
       print "--- URL ERROR ---", e
 
 
-# main
 if __name__ == '__main__':
-  if username == "" or password == "":
+  if (current_account.username == "" or
+      current_account.password == ""):
     print "Error: Please specify your twitter account info"
     sys.exit(1)
   if "--no-color" in sys.argv:
     color = False
 
   sys.stdout = codecs.lookup('utf_8')[-1](sys.stdout)
+  prepare_certification()
+  set_certification()
 
   reader = Reader()
   writer = Writer()
