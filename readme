@@ -1,27 +1,37 @@
-'tw' is a tiny twitter client that works on a shell.
+'tw' is a tiny twitter client that works on your terminal
 
 == CONFIGURE ==
 * username : your account name
 * password : your password
-* hidden : list of names that you don't wnat to watch his/her posts :)
+* hidden : list of names whose tweets you don't want to see :)
 * group_predicates : set of predicates that define 'group'    
-    These predicates take 'status' and should return boolean value.
-    'status' is a XML data. For more information, see:
-       http://apiwiki.twitter.com/Twitter-REST-API-Method%3A-statuses-friends_timeline
+    These predicates take 'tweet' and should return boolean value.
+    'tweet' is a dictionary data and its keys are:
+    id, screen_name, text, created_at and user_id.
+    The key 'text' is the main contents of the tweet.
 
     For example, if you want a group that contains all the posts, add
-      "all":(lambda status: True)
+      "all":(lambda tweet: True)
     to the set 'group_predicates'.
-    or if you want to watch the post in reply to you, add
-      "reply":(lambda status: "(@yourname)" in tagText(status, 'text'))
+    or if you want to watch the post refering you, add
+      "reply":(lambda tweet: "(@yourname)" in tweet["text"])
 
-== USAGE ==
+== COMMAND ==
 * To post the tweet:
     'tw (YOUR TWEET HERE)'
 * To change the group you see:
-    'ch (GROUP NAME)'
-* To change your account:
+    'gr (GROUP NAME)'
+    tw can complement (GROUP NAME) if the partial name isn't ambiguous.
+* To change the account:
     'ac (account number)'
+* To fetch the new tweets:
+    'up'
+* To see the old tweets:
+    'log'
+    When you type 'log', tw enters log-view mode.
+    In this mode, tw behaves like unix command 'more'.
+    Press enter key to see older tweets.
+    Input number to chagne the number of tweets you want to see at one time.
 * To quit:
     'q'
 

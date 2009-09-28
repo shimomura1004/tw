@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import sys, codecs
 import types
@@ -7,215 +7,468 @@ import urllib2
 from threading import Thread
 from xml.dom.minidom import parse
 import datetime
+import Queue
 
-class Account:
-  def __init__(self, username, password, hidden, group_predicates):
-    self.username = username
-    self.password = password
-    self.hidden = hidden
-    self.group_predicates = group_predicates
-    self.current_group = "all"
-    self.last_id = 0
-    self.hndl = None
-    self.req = None
-    self.log = []
 
-accounts = [
-  Account("(username)","(password)", ["(hidden)"], {
-      "all":(lambda status: True),
-      "reply":(lambda status: "(username)" in tagText(status, 'text'))
-      }),
-  Account("(username2)", "(password2)", [], {
-      "all":(lambda status: True)
-      })]
+def print_post(tweet, color_mode=True):
+    """pretty print the tweet"""
+    screen_name = tweet["screen_name"]
+    text = unescape(tweet["text"])
+    timestamp = utc2jst(tweet["created_at"])
+    tweets_id = tweet["id"]
+    
+    if color_mode:
+        print ("\x1b[35m[%s] %s (%s)\n\x1b[39m  %s" %
+               (screen_name, tweets_id, timestamp, text))
+    else:
+        print ("[%s] %s (%s)\n  %s" %
+               (screen_name, tweets_id, timestamp, text))
 
-def prepare_certification():
-  for acc in accounts:
-    hndl = urllib2.HTTPBasicAuthHandler()
-    hndl.add_password('Twitter API', 'http://twitter.com/',
-                      acc.username, acc.password)
-    acc.hndl = hndl
+def prompter(proc, banner):
+    """print given banner, do given proc and delete banner"""
+    sys.stdout.write(banner)
+    sys.stdout.flush()
+    result = proc()
+    for _ in range(len(banner)):
+        sys.stdout.write("\b")
+    sys.stdout.flush()
+    return result
 
-def set_certification():
-  target_url = "http://twitter.com/statuses/friends_timeline.xml"
-  urllib2.install_opener(urllib2.build_opener(current_account.hndl))
-  current_account.req = urllib2.Request(target_url)
+def tagText(xml, tagName):
+    """exploit a value of tag specified by 'tagName' from XML-data"""
+    return xml.getElementsByTagName(tagName)[0].firstChild.nodeValue
 
-def tagText(node, tagName):
-  return node.getElementsByTagName(tagName)[0].firstChild.nodeValue
+def unescape(text):
+    return (text.replace(r'&amp;',r'&').
+            replace(r'&gt;',r'>').replace(r'&lt;',r'<'))
+
+def fill_text(text, length, char=" ", head=True):
+    shortage = length - len(text)
+    if shortage > 0:
+        stuff = ""
+        for _ in range(shortage):
+            stuff += char
+        if head:
+            return stuff+text
+        else:
+            return text+stuff
+    else:
+        return text
 
 def utc2jst(utc_in_twitter_format):
-  utc = (datetime.datetime.
-    strptime(utc_in_twitter_format, '%a %b %d %H:%M:%S +0000 %Y'))
-  td = datetime.timedelta(hours=9)
-  return (utc+td).strftime('%a %b %d %H:%M:%S')
-
-def changeAccount(idx):
-  global account_changed
-  global current_account
-  if idx < len(accounts):
-    account_changed = True
-    current_account = accounts[idx]
+    """translate time format from UTC to JST"""
+    utc = (datetime.datetime.
+           strptime(utc_in_twitter_format, '%a %b %d %H:%M:%S +0000 %Y'))
+    td = datetime.timedelta(hours=9)
+    return (utc+td).strftime('%a %b %d %H:%M:%S')
 
 
-color = True
-writer_is_alive = True
-account_changed = False
-group_changed = False
+friends_timeline_url = "http://twitter.com/statuses/friends_timeline.xml"
+update_status_url    = "http://twitter.com/statuses/update.xml"
 
-current_account = accounts[0]
 
-class Reader(Thread):
-  target_url = "http://twitter.com/statuses/friends_timeline.xml"
-  timer = 0
+class Pager:
+    """This class is an utput manager that print multiline text
+    by some lines, like unix command 'more'"""
+    def __init__(self, generator, color_mode, interval):
+        self.__generator = generator
+        self.__color_mode = color_mode
+        self.__interval = interval
 
-  def __init__(self):
-    Thread.__init__(self)
-  def getTwits(self):
-    try:
-      e = parse(file=urllib2.urlopen(current_account.req))
-      self.check_new_post(e)
-    except Exception, ex:
-      print ex
-    
-  def run(self):
-    global account_changed
-    global group_changed
+    def start(self):
+        counter = 1
+        for tweet in self.__generator():
+            print_post(tweet, self.__color_mode)
+            if counter == 0:
+                text = unicode(raw_input().strip(), "utf-8")
+                if text == "q":
+                    break
+                elif text.isdigit():
+                    self.__interval = int(text)
+                    counter = 0
+            counter = (counter + 1) % self.__interval
 
-    while writer_is_alive:
-      if self.timer == 0:
-        self.getTwits();
+class Strage:
+    """This class is a proxy of Twitter"""
+    def __init__(self, username, password):
+        self.__log = []
+        self.__username = username
+        self.__password = password
+        self.__req      = None
 
-      # if account was changed
-      if account_changed:
-        account_changed = False
-        self.getTwits()
-        self.reprint_log()
-      # if group was changed
-      elif group_changed:
-        group_changed = False
-        self.reprint_log()
+    def install_handler(self):
+        hndl = urllib2.HTTPBasicAuthHandler()
+        hndl.add_password('Twitter API', 'http://twitter.com/',
+                          self.__username, self.__password)
+        urllib2.install_opener(urllib2.build_opener(hndl))
 
-      self.timer = (self.timer + 1) % 60
-      time.sleep(1)
+    def __setup_request(self, url, options):
+        def option_maker(options):
+            option_string = "?"
+            for key in options.keys():
+                option_string += key+"="+str(options[key])+"&"
+            return option_string[:-1]
+        if options:
+            url += option_maker(options)
+        self.__req = urllib2.Request(url)
 
-  def print_status(self, status):
-    def print_post(screen_name, text, timestamp):
-      if color:
-        print ("\x1b[35m%s (%s)\n\x1b[39m  %s" %
-	  (screen_name, timestamp, text))
-      else:
-        print "%s (%s)\n  %s" % (screen_name, timestamp, text)
+    def __get_tweets_from_twitter(self, url, options=None):
+        try:
+            self.__setup_request(friends_timeline_url, options)
+            timeline_xml = prompter(
+                (lambda: parse(file=urllib2.urlopen(self.__req))),
+                "accessing twitter ...")
+            self.__add_tweets_to_strage(timeline_xml)
+        except Exception, ex:
+            print ex
 
-    screen_name = tagText(status, 'screen_name')
-    text = tagText(status, 'text')
-    timestamp = utc2jst(tagText(status, 'created_at'))
-    if ((not screen_name in current_account.hidden) or
-        (current_account.username in text)):
-      if (current_account.group_predicates[
-          current_account.current_group](status)):
-        print_post(screen_name, text, timestamp)
+    def __add_tweets_to_strage(self, timeline_xml):
+        tmp = []
+        for status in reversed(timeline_xml.getElementsByTagName('status')):
+            user_status = status.getElementsByTagName("user")[0]
+            tweet = {
+                "id":int(tagText(status, 'id')),
+                "screen_name":tagText(status, "screen_name"),
+                "text":tagText(status, "text"),
+                "created_at":tagText(status, "created_at"),
+                "user_id":tagText(user_status, "id")
+                }
+            tmp.append(tweet)
 
-  def reprint_log(self):
-    for status in current_account.log:
-      self.print_status(status)
+        if len(tmp) == 0:
+            return
+        elif len(self.__log) == 0:
+            self.__log = tmp
+        elif tmp[-1]["id"] <= self.__log[0]["id"]:
+            self.__log = tmp + self.__log
+        else:
+            self.__log = self.__log + tmp
 
-  def check_new_post(self, e):
-    for status in reversed(e.getElementsByTagName('status')):
-      if current_account.last_id < int(tagText(status, 'id')):
-        current_account.log.append(status)
-        current_account.last_id = int(tagText(status, 'id'))
-        self.print_status(status)
+    def get_old_tweets(self, num):
+        if len(self.__log) > 0:
+            self.__get_tweets_from_twitter(
+                friends_timeline_url,
+                {"max_id":self.__log[0]["id"]})
+        return self.__log[:num]
 
-class Writer(Thread):
-  target_url = "http://twitter.com/statuses/update.xml"
+    def get_new_tweets(self, start, end):
+        if len(self.__log) > 0:
+            self.__get_tweets_from_twitter(
+                friends_timeline_url,
+                {"since_id":self.__log[-1]["id"]})
+        else:
+            self.__get_tweets_from_twitter(friends_timeline_url)
+        return self.__log[-end:len(self.__log)-start]
 
-  def __init__(self):
-    Thread.__init__(self)
+    def get_cached_tweets(self, start, end):
+        if len(self.__log) < end - start:
+            self.get_new_tweets(0, 0)
+        return self.__log[-end:len(self.__log)-start]
 
-  def run(self):
-    global group_changed
+class Account:
+    """A class containing twiiter-account information"""
+    def __init__(self, username, password, hidden, group_predicates,
+                 presenter_queue):
+        self.__username = username
+        self.__password = password
+        self.__hidden   = hidden
+        self.__group_predicates = group_predicates
+        self.__current_group = "all"
+        self.__last_id  = 1
+        self.__strage   = Strage(username, password)
+        self.__presenter_queue = presenter_queue
+    def strage(self):
+        return self.__strage
 
-    while True:
-      try:
-        text = unicode(raw_input().strip(), "utf-8")
-        if text.startswith("tw "):
-          self.send_new_post(text[3:])
+    def install_handler(self):
+        self.__strage.install_handler()
 
-        # change account
-        elif text == "ac":
-          changeAccount(0)
-          set_certification()
-          print "--- account was changed (default) ---"
-        elif text.startswith("ac "):
-          try:
-            changeAccount(int(text[3:]))
-            set_certification()
-            print "--- account was changed (%d) ---" %  int(text[3:])
-          except ValueError:
-            print "--- ACCOUNT ERROR (%s) ---" % text[3:]
-            
-        # change group
-        elif text == "ch":
-          group_changed = True
-          current_account.current_group = "all"
-          print "--- group was changed (all) ---"
-        elif text.startswith("ch "):
-          new_group = None
-          keys = current_account.group_predicates.keys()
-          if text[3:] in keys:
-            new_group = text[3:]
-          else :
+    def check_visible(self, tweet):
+        screen_name = tweet["screen_name"]
+        text = tweet["text"]
+
+        return (((not screen_name in self.__hidden) or
+                 (self.__username in text)) and
+                (self.__group_predicates[self.__current_group](tweet)))
+
+    def change_group(self, group_name):
+        new_group = None
+        keys = self.__group_predicates.keys()
+        if group_name in keys:
+            new_group = group_name
+        else:
             for key in keys:
-              if key.startswith(text[3:]):
-                new_group = key
+                if key.startswith(group_name):
+                    new_group = key
+                    break
+
+        if new_group != None:
+            self.__presenter_queue.put("GROUP_CHANGED")
+            self.__current_group = new_group
+
+        return new_group
+
+    def get_new_tweets(self):
+        result = filter((lambda tweet: self.__last_id < tweet["id"]),
+                        self.__strage.get_new_tweets(0, 20))
+        if len(result) > 0:
+            self.__last_id = result[-1]["id"]
+        return result
+
+    def get_latest_tweets(self):
+        return self.__strage.get_cached_tweets(0, 20)
+
+    def create_history_generator(self):
+        def generator():
+            tweets = filter(self.check_visible,
+                            self.__strage.get_cached_tweets(0,0))
+            while True:
+                for tweet in reversed(tweets):
+                    yield tweet
+                print "accessing twitter ...\r",
+                sys.stdout.flush()
+                tweets = filter(self.check_visible,
+                                self.__strage.get_old_tweets(20))
+        return generator
+
+    def search_in_log(self, target_key, target_val, target):
+        tweets = self.__strage.get_cached_tweets(0,0)
+        for tweet in tweets:
+            if tweet[target_key] == target_val:
+                return tweet[target]
+        return None
+
+class AccountManager:
+    """A class managing several 'Account' instance"""
+    # may need exclusive control
+    def __init__(self, presenter_queue):
+        self.__accounts = []
+        self.__current_account = None
+        self.__presenter_queue = presenter_queue
+    def current_account(self):
+        return self.__current_account
+
+    def add_account(self, new_account):
+        self.__accounts.append(new_account)
+
+    def change_account(self, idx):
+        if ((idx < len(self.__accounts)) and
+            (self.__current_account <> self.__accounts[idx])):
+            self.__current_account = self.__accounts[idx]
+            self.__current_account.install_handler()
+            self.__presenter_queue.put("ACCOUNT_CHANGED")
+
+    def setup(self):
+        if len(self.__accounts) > 0:
+            self.change_account(0)
+            self.__presenter_queue.get()
+        else:
+            return False
+
+
+class TwitterPresenter(Thread):
+    def __init__(self, account_manager, presenter_queue):
+        Thread.__init__(self)
+        self.__account_manager = account_manager
+        self.__presenter_queue = presenter_queue
+        self.__timer = 0
+        self.__load_interval = 60
+        self.__color_mode = True
+    def set_color_mode(self, color_mode):
+        self.__color_mode = color_mode
+
+    def __print_tweets(self, tweets, target_account=None):
+        # if active account hasn't been changed
+        # since "check_new_post"-method was invoked, print tweets.
+        current_account = self.__account_manager.current_account()
+        if ((target_account == None) or
+            (target_account == current_account)):
+            for tweet in tweets:
+                if current_account.check_visible(tweet):
+                    print_post(tweet, self.__color_mode)
+
+    def run(self):
+        while True:
+            if self.__timer == 0:
+                target_account = self.__account_manager.current_account()
+                self.__print_tweets(target_account.get_new_tweets(),
+                                    target_account)
+
+            elif not self.__presenter_queue.empty():
+                target_account = self.__account_manager.current_account()
+                message = self.__presenter_queue.get()
+                if message == "END_SIGNAL":
+                    break
+                elif message == "ACCOUNT_CHANGED":
+                    self.__print_tweets(target_account.get_latest_tweets())
+                elif message == "GROUP_CHANGED":
+                    self.__print_tweets(target_account.get_latest_tweets())
+                elif message == "IN_REPLY_TO":
+                    tweets_id = self.__presenter_queue.get()
+                    tmp = self.__presenter_queue.get()
+                    tmp.put(target_account.
+                            search_in_log("id", int(tweets_id),
+                                          "screen_name"))
+                elif message == "UPDATE":
+                    target_account.get_new_tweets()
+                    self.__print_tweets(target_account.get_latest_tweets(),
+                                        target_account)
+                elif message == "LOG_VIEW_MODE":
+                    queue = self.__presenter_queue.get()
+                    queue.put([target_account.create_history_generator(),
+                               self.__color_mode])
+
+            self.__timer = (self.__timer + 1) % self.__load_interval
+            time.sleep(1)
+
+
+class InputProcessor(Thread):
+    def __init__(self, account_manager, presenter_queue):
+        Thread.__init__(self)
+        self.__account_manager = account_manager
+        self.__presenter_queue = presenter_queue
+
+    def __twCommand(self, text, tweets_id=0):
+        r = urllib2.Request(update_status_url)
+        r.add_header("User-Agent", "TW http://d.hatena.ne.jp/zyxwv/")
+        r.add_header("X-Twitter-Client", "TW")
+        r.add_header("X-Twitter-Client-URL", "http://d.hatena.ne.jp/zyxwv/")
+        r.add_header("X-Twitter-Client-Version", "0.1")
+        if tweets_id == 0:
+            r.add_data("source=TW&status="+
+                       urllib2.quote(text.encode('utf-8')))
+        else:
+            r.add_data("source=TW&status=%s&in_reply_to_status_id=%s" %
+                        (urllib2.quote(text.encode('utf-8')) ,tweets_id))
+        try:
+            status = parse(file=urllib2.urlopen(r))
+            print "--- message was sent ---"
+        except urllib2.HTTPError, e:
+            print "--- HTTP ERROR ---", e
+        except urllib2.URLError, e:
+            print "--- URL ERROR ---", e
+
+    def __reCommand(self, text):
+        tweet_id, body = text.split(" ", 1)
+
+        tmp = Queue.Queue()
+        self.__presenter_queue.put("IN_REPLY_TO")
+        self.__presenter_queue.put(tweet_id)
+        self.__presenter_queue.put(tmp)
+        screen_name = tmp.get()
+
+        if screen_name:
+            self.__twCommand("@"+screen_name+" "+body, tweet_id)
+        else:
+            print "--- No such ID (%s) ---" % tweet_id
+
+    def __acCommand(self, text):
+        if text == "ac":
+            self.__account_manager.change_account(0)
+            print "--- account was changed (default) ---"
+        elif text.startswith("ac "):
+            try:
+                self.__account_manager.change_account(int(text[3:]))
+                print "--- account was changed (%d) ---" % int(text[3:])
+            except ValueError:
+                print "--- ACCOUNT ERROR (%s) ---" % text[3:]
+
+    def __grCommand(self, text):
+        current_account = self.__account_manager.current_account()
+        if text == "gr":
+            current_account.change_group("all")
+            print "--- group was changed (all) ---"
+        elif text.startswith("gr "):
+            group_name = current_account.change_group(text[3:])
+            if group_name:
+                print "--- group was changed (%s) ---" % group_name
+            else:
+                print "--- GROUP ERROR (%s) ---" % text[3:]
+
+    def __upCommand(self):
+        self.__presenter_queue.put("UPDATE")
+        print "--- UPDATE TIMELINE ---"
+
+    def __logCommand(self):
+        tmp_queue = Queue.Queue()
+        print "--- LOG VIEW MODE: push 'q' to quit ---"
+        self.__presenter_queue.put("LOG_VIEW_MODE")
+        self.__presenter_queue.put(tmp_queue)
+        generator, color_mode = tmp_queue.get()
+        pager = Pager(generator, color_mode, 3)
+        pager.start()
+        print "--- QUIT LOG VIEW MODE ---"
+
+    def run(self):
+        while True:
+            try:
+                text = unicode(raw_input().strip(), "utf-8")
+                if text.startswith("tw "):
+                    self.__twCommand(text[3:])
+                elif text.startswith("re "):
+                    self.__reCommand(text[3:])
+                elif text.startswith("ac"):
+                    self.__acCommand(text)
+                elif text.startswith("gr"):
+                    self.__grCommand(text)
+                elif text == "up":
+                    self.__upCommand()
+                elif text == "log":
+                    self.__logCommand()
+                elif text == "q":
+                    raise EOFError
+            except EOFError:
+                self.__presenter_queue.put("END_SIGNAL")
                 break
-          if new_group != None:
-            group_changed = True
-            current_account.current_group = new_group
-            print "--- group was changed (%s) ---" % new_group
-          else:
-            print "--- GROUP ERROR (%s) ---" % text[3:]
 
-        elif text == "q":
-          raise EOFError
+class TW:
+    def __init__(self):
+        # use channels for each node
+        self.__presenter_queue = Queue.Queue()
+        self.__account_manager = AccountManager(self.__presenter_queue)
+        self.__twitter_presenter = TwitterPresenter(
+            self.__account_manager, self.__presenter_queue)
+        self.__input_processor = InputProcessor(
+            self.__account_manager, self.__presenter_queue)
+        self.__twitter_presenter.set_color_mode(
+            not "--no-color" in sys.argv)
 
-      except EOFError:
-        global writer_is_alive
-        writer_is_alive = False
-        break
+    def add_account(self, new_account_info):
+        new_account = Account(new_account_info["username"],
+                              new_account_info["password"],
+                              new_account_info["hidden"],
+                              new_account_info["groups"],
+                              self.__presenter_queue)
+        self.__account_manager.add_account(new_account)
 
-  def send_new_post(self, text):
-    r = urllib2.Request(self.target_url)
-    r.add_header("User-Agent", "TW http://d.hatena.ne.jp/zyxwv/")
-    r.add_header("X-Twitter-Client", "TW")
-    r.add_header("X-Twitter-Client-URL", "http://d.hatena.ne.jp/zyxwv/")
-    r.add_header("X-Twitter-Client-Version", "0.1")
-    r.add_data("source=TW&status="+text.encode('utf-8'))
-    try:
-      status = parse(file=urllib2.urlopen(r))
-      print "--- message was sent ---"
-    except urllib2.HTTPError, e:
-      print "--- HTTP ERROR ---", e
-    except urllib2.URLError, e:
-      print "--- URL ERROR ---", e
+    def main(self):
+        self.__account_manager.setup()
+        self.__twitter_presenter.start()
+        self.__input_processor.start()
+        self.__twitter_presenter.join()
+        self.__input_processor.join()
 
 
 if __name__ == '__main__':
-  if (current_account.username == "" or
-      current_account.password == ""):
-    print "Error: Please specify your twitter account info"
-    sys.exit(1)
-  if "--no-color" in sys.argv:
-    color = False
+    sys.stdout = codecs.lookup('utf_8')[-1](sys.stdout)
 
-  sys.stdout = codecs.lookup('utf_8')[-1](sys.stdout)
-  prepare_certification()
-  set_certification()
-
-  reader = Reader()
-  writer = Writer()
-  reader.start()
-  writer.start()
-  reader.join()
-  writer.join()
+    tw = TW()
+    tw.add_account(
+        {"username":"(username)",
+         "password":"(password)",
+         "hidden":["(hidden)"],
+         "groups":{
+                "all":(lambda status: True),
+                "reply":(lambda tweet:
+                             "(username)" in tweet["text"])
+                }
+         })
+    tw.add_account(
+        {"username":"(username2)",
+         "password":"(password2)",
+         "hidden":[],
+         "groups":{
+                "all":(lambda tweet: True)
+                }
+         })
+    tw.main()
