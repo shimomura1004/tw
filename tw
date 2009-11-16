@@ -1,474 +1,627 @@
-#!/usr/bin/env python
+#!/opt/local/bin/python2.6
 
-import sys, codecs
+# input screen_name -> latest post
+# support: retweet, lists
+# support: easier way to see the reply-sequence
+
+import sys
+import codecs
 import types
 import time
 import urllib2
 from threading import Thread
-from xml.dom.minidom import parse
 import datetime
 import Queue
+import json
+import re
 
-
-def print_post(tweet, color_mode=True):
-    """pretty print the tweet"""
-    screen_name = tweet["screen_name"]
-    text = unescape(tweet["text"])
-    timestamp = utc2jst(tweet["created_at"])
-    tweets_id = tweet["id"]
-    
-    if color_mode:
-        print ("\x1b[35m[%s] %s (%s)\n\x1b[39m  %s" %
-               (screen_name, tweets_id, timestamp, text))
-    else:
-        print ("[%s] %s (%s)\n  %s" %
-               (screen_name, tweets_id, timestamp, text))
-
-def prompter(proc, banner):
-    """print given banner, do given proc and delete banner"""
-    sys.stdout.write(banner)
-    sys.stdout.flush()
-    result = proc()
-    for _ in range(len(banner)):
-        sys.stdout.write("\b")
-    sys.stdout.flush()
-    return result
-
-def tagText(xml, tagName):
-    """exploit a value of tag specified by 'tagName' from XML-data"""
-    return xml.getElementsByTagName(tagName)[0].firstChild.nodeValue
 
 def unescape(text):
     return (text.replace(r'&amp;',r'&').
-            replace(r'&gt;',r'>').replace(r'&lt;',r'<'))
-
-def fill_text(text, length, char=" ", head=True):
-    shortage = length - len(text)
-    if shortage > 0:
-        stuff = ""
-        for _ in range(shortage):
-            stuff += char
-        if head:
-            return stuff+text
-        else:
-            return text+stuff
-    else:
-        return text
+            replace(r'&gt;',r'>').replace(r'&lt;',r'<').
+            replace(r'&quot;', r'"'))
 
 def utc2jst(utc_in_twitter_format):
     """translate time format from UTC to JST"""
-    utc = (datetime.datetime.
-           strptime(utc_in_twitter_format, '%a %b %d %H:%M:%S +0000 %Y'))
+    utc = None
+    try:
+        utc = datetime.datetime.strptime(utc_in_twitter_format,\
+                                             '%a %b %d %H:%M:%S +0000 %Y')
+    except ValueError:
+        utc = datetime.datetime.strptime(utc_in_twitter_format,\
+                                             '%a, %d %b %Y %H:%M:%S +0000')
     td = datetime.timedelta(hours=9)
     return (utc+td).strftime('%a %b %d %H:%M:%S')
 
 
-friends_timeline_url = "http://twitter.com/statuses/friends_timeline.xml"
-update_status_url    = "http://twitter.com/statuses/update.xml"
-
-
 class Pager:
-    """This class is an utput manager that print multiline text
-    by some lines, like unix command 'more'"""
-    def __init__(self, generator, color_mode, interval):
+    def __init__(self, generator, interval):
         self.__generator = generator
-        self.__color_mode = color_mode
-        self.__interval = interval
+        self.__interval  = interval
 
     def start(self):
-        counter = 1
-        for tweet in self.__generator():
-            print_post(tweet, self.__color_mode)
-            if counter == 0:
-                text = unicode(raw_input().strip(), "utf-8")
+        counter = 0
+        for item in self.__generator:
+            item.print_this()
+            counter += 1
+            if counter == self.__interval:
+                sys.stdout.write("> ")
+                try:
+                    text = unicode(raw_input().strip(), "utf-8")
+                except EOFError:
+                    break
                 if text == "q":
                     break
                 elif text.isdigit():
                     self.__interval = int(text)
-                    counter = 0
-            counter = (counter + 1) % self.__interval
+                counter = 0
 
-class Strage:
-    """This class is a proxy of Twitter"""
+class Printee:
+    def __init__(self):
+        pass
+    def print_this(self):
+        if "--no-color" in sys.argv:
+            self.print_in_mono()
+        else:
+            self.print_in_color()
+    def print_in_color(self):
+        self.print_in_mono()
+    def print_in_mono(self):
+        self.print_in_color()
+class Tweet(Printee):
+    def __init__(self):
+        Printee.__init__(self)
+        self.id              = None
+        self.screen_name     = None
+        self.text            = None
+        self.created_at      = None
+        self.user_id         = None
+        self.reply_tweet_id  = None
+        self.reply_user_id   = None
+        self.reply_user_name = None
+    def print_in_mono(self):
+        print ("[%s] %s (%s)\n  %s" %
+               (self.screen_name, self.id,
+                utc2jst(self.created_at), unescape(self.text)))
+    def print_in_color(self):
+        print ("\x1b[35m[%s] %s (%s)\n\x1b[39m  %s" %
+               (self.screen_name, self.id,
+                utc2jst(self.created_at), unescape(self.text)))
+class Person(Printee):
+    def __init__(self):
+        Printee.__init__(self)
+        self.name            = None
+        self.screen_name     = None
+        self.friends_count   = None
+        self.followers_count = None
+    def print_in_mono(self):
+        print ("%s(%s) %d/%d" % (self.name, self.screen_name,
+                                 self.friends_count, self.followers_count))
+
+class Timeline:
+    def __init__(self):
+        self.url      = None
+        self.timeline = []
+        self.options = {}
+    def __str__(self):
+        return self.__class__.__name__
+    def __url_maker(self, options):
+        url = self.url
+        options_string = ""
+        for key in options.keys():
+            if options[key]:
+                options_string += "&"+key+"="+str(options[key])
+        for key in self.options.keys():
+            if self.options[key]:
+                options_string += "&"+key+"="+str(self.options[key])
+        if options_string <> "":
+            url += "?" + options_string[1:]
+        return url
+    def __access_twitter(self, options={}):
+        result = []
+        url = self.__url_maker(options)
+        try:
+            tweets_text = urllib2.urlopen(urllib2.Request(url)).\
+                read().decode('utf_8')
+            result = self.results_parser(tweets_text)
+        except Exception, ex:
+            print "Error occurred while accessing twitter"
+            print ex
+        result.reverse()
+        return result
+    def results_parser(self, jsontext):
+        result = []
+        tweets = json.loads(jsontext)
+        for tweet in tweets:
+            tmp = Tweet()
+            tmp.id = tweet["id"]
+            tmp.screen_name = tweet["user"]["screen_name"]
+            tmp.text = tweet["text"]
+            tmp.created_at = tweet["created_at"]
+            tmp.user_id = tweet["user"]["id"]
+            tmp.reply_tweet_id = tweet["in_reply_to_status_id"]
+            tmp.reply_user_id = tweet["in_reply_to_user_id"]
+            tmp.reply_user_name = tweet["in_reply_to_screen_name"]
+            result.append(tmp)
+        return result
+
+    def get_new_tweets(self):
+        """return newly posted tweets"""
+        if len(self.timeline) > 0:
+            new_tweets =\
+                self.__access_twitter({"since_id":self.timeline[-1].id})
+        else:
+            new_tweets = self.__access_twitter()
+        self.timeline += new_tweets
+        return new_tweets
+
+    def get_and_print_new_tweets(self):
+        for tweet in self.get_new_tweets():
+            tweet.print_this()
+
+    def get_latest_tweets(self, num=20):
+        """return the latest tweets in timeline"""
+        return self.timeline[-num:]
+
+    def reprint_latest_tweets(self, num=20):
+        if len(self.get_latest_tweets(num)) == 0:
+            self.get_new_tweets()
+        for tweet in self.get_latest_tweets(num):
+            tweet.print_this()
+
+    def get_older_tweets_generator(self):
+        max_retry_count = 3
+        def generator():
+            counter = 0
+            tweets = self.timeline
+            while True:
+                for tweet in reversed(tweets):
+                    yield tweet
+                print "accessing twitter ... (%d)\r" % (counter+1),
+                sys.stdout.flush()
+                if len(self.timeline) == 0:
+                    tweets = self.__access_twitter({"count":100})
+                else:
+                    tweets = self.__access_twitter(
+                        {"max_id":self.timeline[0].id-1, "count":100})
+                if len(tweets) == 0:
+                    counter += 1
+                    if counter == max_retry_count:
+                        sys.stdout.write("\ncontinue?(y/N): ")
+                        text = unicode(raw_input().strip(), "utf-8")
+                        if text == "y":
+                            counter = 0
+                        else:
+                            break
+                else:
+                    counter = 0
+                self.timeline = tweets + self.timeline
+        return generator()
+
+    def filter_timeline(self, pred):
+        self.timeline = filter(pred, self.timeline)
+    def search_timeline(self, pred):
+        return filter(pred, self.timeline)
+
+class HomeTimeline(Timeline):
+    def __init__(self):
+        Timeline.__init__(self)
+        self.url = "http://twitter.com/statuses/home_timeline.json"
+
+#class ListTimeline(Timeline):
+
+class UserTimeline(Timeline):
+    def __init__(self, user=None):
+        Timeline.__init__(self)
+        self.url = "http://twitter.com/statuses/user_timeline.json"
+        self.options = {"id":user}
+
+class FavoriteTimeline(Timeline):
+    def __init__(self, user=None):
+        Timeline.__init__(self)
+        self.url = "http://twitter.com/favorites.json"
+        self.options = {"id":user}
+
+class MentionTimeline(Timeline):
+    def __init__(self):
+        Timeline.__init__(self)
+        self.url = "http://twitter.com/statuses/mentions.json"
+
+class DirectMessageTimeline(Timeline):
+    def __init__(self):
+        Timeline.__init__(self)
+        self.url = "http://twitter.com/direct_messages.json"
+    def results_parser(self, jsontext):
+        result = []
+        dms = json.loads(jsontext)
+        for dm in dms:
+            tmp = Tweet()
+            tmp.id = dm["id"]
+            tmp.screen_name = dm["sender"]["screen_name"]
+            tmp.text = dm["text"]
+            tmp.created_at = dm["created_at"]
+            tmp.user_id = dm["sender"]["id"]
+            result.append(tmp)
+        return result
+
+class FollowingTimeline(Timeline):
+    def __init__(self, user=None):
+        Timeline.__init__(self)
+        self.url = "http://twitter.com/statuses/friends.json"
+    def results_parser(self, jsontext):
+        result = []
+        followings = json.loads(jsontext)
+        for following in followings:
+            tmp = Person()
+            tmp.name            = following["name"]
+            tmp.screen_name     = following["screen_name"]
+            tmp.friends_count   = following["friends_count"]
+            tmp.followers_count = following["followers_count"]
+            result.append(tmp)
+        return result
+    def get_older_tweets_generator(self):
+        people = self.timeline
+        for person in reversed(people):
+            yield person
+
+class FollowerTimeline(Timeline):
+    def __init__(self, user=None):
+        Timeline.__init__(self)
+        self.url = "http://twitter.com/statuses/followers.json"
+    def results_parser(self, jsontext):
+        result = []
+        followers = json.loads(jsontext)
+        for follower in followers:
+            tmp = Person()
+            tmp.name            = follower["name"]
+            tmp.screen_name     = follower["screen_name"]
+            tmp.friends_count   = follower["friends_count"]
+            tmp.followers_count = follower["followers_count"]
+            result.append(tmp)
+        return result
+    def get_older_tweets_generator(self):
+        people = self.timeline
+        for person in reversed(people):
+            yield person
+
+class GlobalSearchTimeline(Timeline):
+    def __init__(self, query=""):
+        Timeline.__init__(self)
+        self.url = "http://search.twitter.com/search.json"
+        self.options = {"q":urllib2.quote(query.encode('utf-8'))}
+    def results_parser(self, jsontext):
+        result = []
+        tweets = json.loads(jsontext)
+        for tweet in tweets["results"]:
+            tmp = Tweet()
+            tmp.id = tweet["id"]
+            tmp.screen_name = tweet["from_user"]
+            tmp.text = tweet["text"]
+            tmp.created_at = tweet["created_at"]
+            tmp.user_id = None
+            result.append(tmp)
+        return result
+
+class LocalSearchTimeline(Timeline):
+    def __init__(self, original=None, pred=""):
+        Timeline.__init__(self)
+        self.original = original
+        self.pred     = None
+        try:
+            if pred.startswith("lambda"):
+                self.pred = eval(pred)
+            else:
+                def p(tweet):
+                    return (tweet.screen_name.find(pred) <> -1
+                            or tweet.text.find(pred) <> -1)
+                self.pred = p
+        except Exception, ex:
+            print "Error occurred while parsing query"
+            print ex
+            self.pred = lambda tweet: True
+
+    def results_parser(self, jsontext):
+        return self.original.results_parser(jsontext)
+    def get_new_tweets(self):
+        return self.original.get_new_tweets()
+    def get_and_print_new_tweets(self):
+        for tweet in filter(self.pred, self.get_new_tweets()):
+            tweet.print_this()
+    def get_latest_tweets(self, num=20):
+        return filter(self.pred, self.original.get_latest_tweets(num))
+    def reprint_latest_tweets(self, num=20):
+        if len(self.original.get_latest_tweets(num)) == 0:
+            self.original.get_new_tweets()
+        for tweet in self.get_latest_tweets(num):
+            tweet.print_this()
+    def get_older_tweets_generator(self):
+        def generator():
+            for tweet in self.original.get_older_tweets_generator():
+                if self.pred(tweet):
+                    yield(tweet)
+        return generator()
+    def filter_timeline(self, pred):
+        return self.original.filter_timeline(pred)
+
+
+class Account:
     def __init__(self, username, password):
-        self.__log = []
-        self.__username = username
-        self.__password = password
-        self.__req      = None
+        self.__username       = username
+        self.__password       = password
+        self.timelines        = {}
+        self.current_timeline = None
+        self.groups           = {}
+    def __hash(self, Klass, **kwargs):
+        result = Klass.__name__
+        for key in kwargs.keys():
+            result += key+kwargs[key].__str__()
+        return result
 
     def install_handler(self):
+        """set basic-auth handler for this instance's account to urllib2"""
         hndl = urllib2.HTTPBasicAuthHandler()
         hndl.add_password('Twitter API', 'http://twitter.com/',
                           self.__username, self.__password)
         urllib2.install_opener(urllib2.build_opener(hndl))
-
-    def __setup_request(self, url, options):
-        def option_maker(options):
-            option_string = "?"
-            for key in options.keys():
-                option_string += key+"="+str(options[key])+"&"
-            return option_string[:-1]
-        if options:
-            url += option_maker(options)
-        self.__req = urllib2.Request(url)
-
-    def __get_tweets_from_twitter(self, url, options=None):
-        try:
-            self.__setup_request(friends_timeline_url, options)
-            timeline_xml = prompter(
-                (lambda: parse(file=urllib2.urlopen(self.__req))),
-                "accessing twitter ...")
-            self.__add_tweets_to_strage(timeline_xml)
-        except Exception, ex:
-            print ex
-
-    def __add_tweets_to_strage(self, timeline_xml):
-        tmp = []
-        for status in reversed(timeline_xml.getElementsByTagName('status')):
-            user_status = status.getElementsByTagName("user")[0]
-            tweet = {
-                "id":int(tagText(status, 'id')),
-                "screen_name":tagText(status, "screen_name"),
-                "text":tagText(status, "text"),
-                "created_at":tagText(status, "created_at"),
-                "user_id":tagText(user_status, "id")
-                }
-            tmp.append(tweet)
-
-        if len(tmp) == 0:
+    def change_timeline(self, Klass, **kwargs):
+        if Klass in [GlobalSearchTimeline]:
+            self.current_timeline = Klass(**kwargs)
             return
-        elif len(self.__log) == 0:
-            self.__log = tmp
-        elif tmp[-1]["id"] <= self.__log[0]["id"]:
-            self.__log = tmp + self.__log
+
+        if not self.timelines.has_key(self.__hash(Klass, **kwargs)):
+            self.timelines[self.__hash(Klass, **kwargs)] = Klass(**kwargs)
+        self.current_timeline = self.timelines[self.__hash(Klass, **kwargs)]
+        
+    def change_timeline_with(self, timeline):
+        self.current_timeline = timeline
+
+class AccountManager(Thread):
+    def __init__(self, accounts, queue):
+        Thread.__init__(self)
+        self.timer           = 0
+        self.load_interval   = 60
+        self.finish          = False
+        self.queue           = queue
+        self.accounts        = []
+        self.current_account = None
+
+        for account in accounts:
+            newaccount = Account(account[0], account[1])
+            for grp in account[2].keys():
+                newaccount.groups[grp] = account[2][grp]
+            self.accounts.append(newaccount)
+        self.current_account = self.accounts[0]
+        self.current_account.change_timeline(HomeTimeline)
+        self.current_account.install_handler()
+
+    def change_account(self, *args):
+        self.queue.get()
+        if len(args) > 0:
+            if args[0].isdigit():
+                self.current_account = self.accounts[int(args[0])]
+                print "--- account was changed (%s) ---" % args[0]
+            else:
+                print "--- ERROR: '%s' is not a number ---"
+                return
         else:
-            self.__log = self.__log + tmp
+            self.current_account = self.accounts[0]
+            print "--- account was changed (default) ---"
 
-    def get_old_tweets(self, num):
-        if len(self.__log) > 0:
-            self.__get_tweets_from_twitter(
-                friends_timeline_url,
-                {"max_id":self.__log[0]["id"]})
-        return self.__log[:num]
+        self.current_account.change_timeline(HomeTimeline)
+        self.current_account.install_handler()
+        self.current_account.current_timeline.reprint_latest_tweets()
+        self.queue.put(None)
 
-    def get_new_tweets(self, start, end):
-        if len(self.__log) > 0:
-            self.__get_tweets_from_twitter(
-                friends_timeline_url,
-                {"since_id":self.__log[-1]["id"]})
-        else:
-            self.__get_tweets_from_twitter(friends_timeline_url)
-        return self.__log[-end:len(self.__log)-start]
-
-    def get_cached_tweets(self, start, end):
-        if len(self.__log) < end - start:
-            self.get_new_tweets(0, 0)
-        return self.__log[-end:len(self.__log)-start]
-
-class Account:
-    """A class containing twiiter-account information"""
-    def __init__(self, username, password, hidden, group_predicates,
-                 presenter_queue):
-        self.__username = username
-        self.__password = password
-        self.__hidden   = hidden
-        self.__group_predicates = group_predicates
-        self.__current_group = "all"
-        self.__last_id  = 1
-        self.__strage   = Strage(username, password)
-        self.__presenter_queue = presenter_queue
-    def strage(self):
-        return self.__strage
-
-    def install_handler(self):
-        self.__strage.install_handler()
-
-    def check_visible(self, tweet):
-        screen_name = tweet["screen_name"]
-        text = tweet["text"]
-
-        return (((not screen_name in self.__hidden) or
-                 (self.__username in text)) and
-                (self.__group_predicates[self.__current_group](tweet)))
+    def change_timeline(self, Klass, **kwargs):
+        self.current_account.change_timeline(Klass, **kwargs)
+        self.current_account.current_timeline.reprint_latest_tweets()
 
     def change_group(self, group_name):
-        new_group = None
-        keys = self.__group_predicates.keys()
-        if group_name in keys:
-            new_group = group_name
-        else:
-            for key in keys:
-                if key.startswith(group_name):
-                    new_group = key
-                    break
-
-        if new_group != None:
-            self.__presenter_queue.put("GROUP_CHANGED")
-            self.__current_group = new_group
-
-        return new_group
-
-    def get_new_tweets(self):
-        result = filter((lambda tweet: self.__last_id < tweet["id"]),
-                        self.__strage.get_new_tweets(0, 20))
-        if len(result) > 0:
-            self.__last_id = result[-1]["id"]
-        return result
-
-    def get_latest_tweets(self):
-        return self.__strage.get_cached_tweets(0, 20)
-
-    def create_history_generator(self):
-        def generator():
-            tweets = filter(self.check_visible,
-                            self.__strage.get_cached_tweets(0,0))
-            while True:
-                for tweet in reversed(tweets):
-                    yield tweet
-                print "accessing twitter ...\r",
-                sys.stdout.flush()
-                tweets = filter(self.check_visible,
-                                self.__strage.get_old_tweets(20))
-        return generator
-
-    def search_in_log(self, target_key, target_val, target):
-        tweets = self.__strage.get_cached_tweets(0,0)
-        for tweet in tweets:
-            if tweet[target_key] == target_val:
-                return tweet[target]
-        return None
-
-class AccountManager:
-    """A class managing several 'Account' instance"""
-    # may need exclusive control
-    def __init__(self, presenter_queue):
-        self.__accounts = []
-        self.__current_account = None
-        self.__presenter_queue = presenter_queue
-    def current_account(self):
-        return self.__current_account
-
-    def add_account(self, new_account):
-        self.__accounts.append(new_account)
-
-    def change_account(self, idx):
-        if ((idx < len(self.__accounts)) and
-            (self.__current_account <> self.__accounts[idx])):
-            self.__current_account = self.__accounts[idx]
-            self.__current_account.install_handler()
-            self.__presenter_queue.put("ACCOUNT_CHANGED")
-
-    def setup(self):
-        if len(self.__accounts) > 0:
-            self.change_account(0)
-            self.__presenter_queue.get()
-        else:
-            return False
-
-
-class TwitterPresenter(Thread):
-    def __init__(self, account_manager, presenter_queue):
-        Thread.__init__(self)
-        self.__account_manager = account_manager
-        self.__presenter_queue = presenter_queue
-        self.__timer = 0
-        self.__load_interval = 60
-        self.__color_mode = True
-    def set_color_mode(self, color_mode):
-        self.__color_mode = color_mode
-
-    def __print_tweets(self, tweets, target_account=None):
-        # if active account hasn't been changed
-        # since "check_new_post"-method was invoked, print tweets.
-        current_account = self.__account_manager.current_account()
-        if ((target_account == None) or
-            (target_account == current_account)):
-            for tweet in tweets:
-                if current_account.check_visible(tweet):
-                    print_post(tweet, self.__color_mode)
+        print "--- timeline was changed (%s) ---" % group_name
+        self.current_account.change_timeline_with(
+                self.current_account.groups[group_name])
+        self.current_account.current_timeline.reprint_latest_tweets()
 
     def run(self):
-        while True:
-            if self.__timer == 0:
-                target_account = self.__account_manager.current_account()
-                self.__print_tweets(target_account.get_new_tweets(),
-                                    target_account)
+        while not self.finish:
+            self.queue.get()
+            if self.timer == 0:
+                self.current_account.current_timeline.\
+                    get_and_print_new_tweets()
+            self.queue.put(None)
 
-            elif not self.__presenter_queue.empty():
-                target_account = self.__account_manager.current_account()
-                message = self.__presenter_queue.get()
-                if message == "END_SIGNAL":
-                    break
-                elif message == "ACCOUNT_CHANGED":
-                    self.__print_tweets(target_account.get_latest_tweets())
-                elif message == "GROUP_CHANGED":
-                    self.__print_tweets(target_account.get_latest_tweets())
-                elif message == "IN_REPLY_TO":
-                    tweets_id = self.__presenter_queue.get()
-                    tmp = self.__presenter_queue.get()
-                    tmp.put(target_account.
-                            search_in_log("id", int(tweets_id),
-                                          "screen_name"))
-                elif message == "UPDATE":
-                    target_account.get_new_tweets()
-                    self.__print_tweets(target_account.get_latest_tweets(),
-                                        target_account)
-                elif message == "LOG_VIEW_MODE":
-                    queue = self.__presenter_queue.get()
-                    queue.put([target_account.create_history_generator(),
-                               self.__color_mode])
-
-            self.__timer = (self.__timer + 1) % self.__load_interval
+            self.timer = (self.timer + 1) % self.load_interval
             time.sleep(1)
 
 
-class InputProcessor(Thread):
-    def __init__(self, account_manager, presenter_queue):
-        Thread.__init__(self)
-        self.__account_manager = account_manager
-        self.__presenter_queue = presenter_queue
+class Command:
+    def __init__(self, position, keys, proc, spacer=" "):
+        self.position = position
+        self.keys     = keys
+        self.proc     = proc
+        self.spacer   = spacer
+    def __call__(self, text):
+        is_matched = False
+        for key in self.keys:
+            if self.position&1:
+                if text.startswith(key+self.spacer):
+                    self.proc(key, text[len(key+self.spacer):])
+                    is_matched = True
+            if self.position&2:
+                if text.endswith(self.spacer+key):
+                    self.proc(key, text[:-len(self.spacer+key)])
+                    is_matched = True
+            if self.position&4:
+                if text == key:
+                    self.proc(key, None)
+                    is_matched = True
+        return is_matched
 
-    def __twCommand(self, text, tweets_id=0):
-        r = urllib2.Request(update_status_url)
+        
+class TW:
+    def __init__(self, accounts):
+        self.commands       = []
+        self.queue          = Queue.Queue()
+        self.accountManager = AccountManager(accounts, self.queue)
+        self.queue.put(None)
+    def __add_header(self, url):
+        r = urllib2.Request(url)
         r.add_header("User-Agent", "TW http://d.hatena.ne.jp/zyxwv/")
         r.add_header("X-Twitter-Client", "TW")
         r.add_header("X-Twitter-Client-URL", "http://d.hatena.ne.jp/zyxwv/")
         r.add_header("X-Twitter-Client-Version", "0.1")
-        if tweets_id == 0:
+        return r
+    def parse_id(self, text):
+        screen_name, tweet_id, body = None, None, None
+        m = re.search(r"^\[(.*)\]\s+(\d+)", text)
+        if m:
+            screen_name, tweet_id = m.groups()
+            body = text[m.end():].strip()
+        else:
+            m = re.search(r"^(\d+)", text)
+            if m:
+                tweet_id = m.group()
+                body = text[m.end():].strip()
+                tweets = self.accountManager.current_account.\
+                    current_timeline.search_timeline(
+                    lambda t: t.id == int(tweet_id))
+                screen_name = tweets[-1].screen_name
+        return (screen_name, tweet_id, body)
+
+    def __post(self, _, text, tweet_id=""):
+        if len(text) > 140:
+            print "--- MESSAGE SIZE ERROR (%d) ---" % len(text)
+            return
+        r = self.__add_header("http://twitter.com/statuses/update.json")
+        if tweet_id == "":
             r.add_data("source=TW&status="+
                        urllib2.quote(text.encode('utf-8')))
         else:
             r.add_data("source=TW&status=%s&in_reply_to_status_id=%s" %
-                        (urllib2.quote(text.encode('utf-8')) ,tweets_id))
+                       (urllib2.quote(text.encode('utf-8')) ,tweet_id))
         try:
-            status = parse(file=urllib2.urlopen(r))
+            urllib2.urlopen(r)
             print "--- message was sent ---"
         except urllib2.HTTPError, e:
             print "--- HTTP ERROR ---", e
         except urllib2.URLError, e:
             print "--- URL ERROR ---", e
-
-    def __reCommand(self, text):
-        tweet_id, body = text.split(" ", 1)
-
-        tmp = Queue.Queue()
-        self.__presenter_queue.put("IN_REPLY_TO")
-        self.__presenter_queue.put(tweet_id)
-        self.__presenter_queue.put(tmp)
-        screen_name = tmp.get()
-
+    def __reply(self, _, text):
+        (screen_name, tweet_id, body) = self.parse_id(text)
         if screen_name:
-            self.__twCommand("@"+screen_name+" "+body, tweet_id)
+            self.__post(None, "@"+screen_name+" "+body, tweet_id)
         else:
             print "--- No such ID (%s) ---" % tweet_id
-
-    def __acCommand(self, text):
-        if text == "ac":
-            self.__account_manager.change_account(0)
-            print "--- account was changed (default) ---"
-        elif text.startswith("ac "):
-            try:
-                self.__account_manager.change_account(int(text[3:]))
-                print "--- account was changed (%d) ---" % int(text[3:])
-            except ValueError:
-                print "--- ACCOUNT ERROR (%s) ---" % text[3:]
-
-    def __grCommand(self, text):
-        current_account = self.__account_manager.current_account()
-        if text == "gr":
-            current_account.change_group("all")
-            print "--- group was changed (all) ---"
-        elif text.startswith("gr "):
-            group_name = current_account.change_group(text[3:])
-            if group_name:
-                print "--- group was changed (%s) ---" % group_name
-            else:
-                print "--- GROUP ERROR (%s) ---" % text[3:]
-
-    def __upCommand(self):
-        self.__presenter_queue.put("UPDATE")
-        print "--- UPDATE TIMELINE ---"
-
-    def __logCommand(self):
-        tmp_queue = Queue.Queue()
-        print "--- LOG VIEW MODE: push 'q' to quit ---"
-        self.__presenter_queue.put("LOG_VIEW_MODE")
-        self.__presenter_queue.put(tmp_queue)
-        generator, color_mode = tmp_queue.get()
-        pager = Pager(generator, color_mode, 3)
-        pager.start()
+    def __delete(self, _, text):
+        (_,id,_) = self.parse_id(text)
+        r = self.__add_header(
+            "http://twitter.com/statuses/destroy.json")
+        r.add_data("id="+id)
+        try:
+            urllib2.urlopen(r)
+            self.accountManager.current_account.\
+                current_timeline.filter_timeline(
+                lambda tweet: tweet.id <> int(id))
+            print "--- DELETE POST (%s) ---" % id
+        except Exception, ex:
+            print ex
+    def __update(self, _1, _2):
+        self.accountManager.current_account.\
+            current_timeline.get_new_tweets()
+        self.accountManager.current_account.\
+            current_timeline.reprint_latest_tweets()
+    def __seelog(self, _1, _2):
+        print "--- LOG VIEW MODE: press 'q' to quit ---"
+        self.queue.get()
+        Pager(self.accountManager.current_account.\
+                  current_timeline.get_older_tweets_generator(),3).start()
+        self.queue.put(None)
         print "--- QUIT LOG VIEW MODE ---"
+    def __trace(self, _, text):
+        print "not yet implemented"
 
-    def run(self):
+    def main(self):
+        def switch(message, Klass, **kwargs):
+            print message
+            self.accountManager.change_timeline(Klass, **kwargs)
+        def add_command(pos, keys, proc, spacer=" "):
+            self.commands.append(Command(pos, keys, proc, spacer))
+        
+        add_command(3, ["tw","post"],         self.__post)
+        add_command(3, ["del","rm"],          self.__delete)
+        add_command(3, ["re"],                self.__reply)
+        add_command(3, ["track","trace","t"], self.__trace)
+        add_command(4, ["up", "r"],           self.__update)
+        add_command(4, ["log", "history"],    self.__seelog)
+
+        add_command(4, ["home"],
+                    (lambda _1,_2: switch("--- Your home timeline ---",
+                                          HomeTimeline)))
+        add_command(4, ["mention"],
+                    (lambda _1,_2: switch("--- Mention timeline ---",
+                                          MentionTimeline)))
+        add_command(4, ["dms"],
+                    (lambda _1,_2:switch("--- Your direct messages ---",
+                                         DirectMessageTimeline)))
+        add_command(7, ["user"],
+                    (lambda _,id: switch(
+                    (id <> None and
+                     ("--- User %s's timeline ---" % id) or
+                     ("--- Your timeline ---")),
+                    UserTimeline, user=id)))
+        add_command(7, ["fav"],
+                    (lambda _,id: switch(
+                    (id <> None and
+                     ("--- User %s's favorites ---" % id) or
+                     ("--- Your favorites ---")),
+                    FavoriteTimeline,user=id)))
+        add_command(7, ["following"],
+                    (lambda _,id: switch(
+                    (id <> None and
+                     ("-- User %s's followings ---" % id) or
+                     ("--- Your followings ---")),
+                    FollowingTimeline,user=id)))
+        add_command(7, ["follower"],
+                    (lambda _,id: switch(
+                    (id <> None and
+                     ("-- User %s's followers ---" % id) or
+                     ("--- Your followers ---")),
+                    FollowerTimeline,user=id)))
+        add_command(1, ["//", "g/"],
+                    (lambda _,query: switch(
+                    "--- GLOBAL SEARCH TIMELINE (%s) ---" % query,
+                    GlobalSearchTimeline, query=query)), "")
+        add_command(1, ["/", "l/"],
+                    (lambda _,query: switch(
+                    "--- LOCAL SEARCH TIMELINE (%s) ---" % query,
+                    LocalSearchTimeline,
+                    original=self.accountManager.current_account.\
+                        current_timeline,
+                    pred=query)), "")
+        def quit(_1,_2): raise EOFError
+        add_command(4, ["q","quit","exit"], quit)
+        add_command(7, ["ac"],
+                    (lambda _,ac:
+                         self.accountManager.change_account(ac or "0")))
+        add_command(4, # change timeline with specified group
+                    self.accountManager.current_account.groups.keys(),
+                    (lambda grp,_: self.accountManager.change_group(grp)))
+
+        self.accountManager.start()
         while True:
             try:
                 text = unicode(raw_input().strip(), "utf-8")
-                if text.startswith("tw "):
-                    self.__twCommand(text[3:])
-                elif text.startswith("re "):
-                    self.__reCommand(text[3:])
-                elif text.startswith("ac"):
-                    self.__acCommand(text)
-                elif text.startswith("gr"):
-                    self.__grCommand(text)
-                elif text == "up":
-                    self.__upCommand()
-                elif text == "log":
-                    self.__logCommand()
-                elif text == "q":
-                    raise EOFError
+                for command in self.commands:
+                    if command(text):
+                        break
             except EOFError:
-                self.__presenter_queue.put("END_SIGNAL")
+                self.accountManager.finish = True
                 break
-
-class TW:
-    def __init__(self):
-        # use channels for each node
-        self.__presenter_queue = Queue.Queue()
-        self.__account_manager = AccountManager(self.__presenter_queue)
-        self.__twitter_presenter = TwitterPresenter(
-            self.__account_manager, self.__presenter_queue)
-        self.__input_processor = InputProcessor(
-            self.__account_manager, self.__presenter_queue)
-        self.__twitter_presenter.set_color_mode(
-            not "--no-color" in sys.argv)
-
-    def add_account(self, new_account_info):
-        new_account = Account(new_account_info["username"],
-                              new_account_info["password"],
-                              new_account_info["hidden"],
-                              new_account_info["groups"],
-                              self.__presenter_queue)
-        self.__account_manager.add_account(new_account)
-
-    def main(self):
-        self.__account_manager.setup()
-        self.__twitter_presenter.start()
-        self.__input_processor.start()
-        self.__twitter_presenter.join()
-        self.__input_processor.join()
+        self.accountManager.join()
 
 
 if __name__ == '__main__':
     sys.stdout = codecs.lookup('utf_8')[-1](sys.stdout)
-
-    tw = TW()
-    tw.add_account(
-        {"username":"(username)",
-         "password":"(password)",
-         "hidden":["(hidden)"],
-         "groups":{
-                "all":(lambda status: True),
-                "reply":(lambda tweet:
-                             "(username)" in tweet["text"])
-                }
-         })
-    tw.add_account(
-        {"username":"(username2)",
-         "password":"(password2)",
-         "hidden":[],
-         "groups":{
-                "all":(lambda tweet: True)
-                }
-         })
-    tw.main()
+    TW([["(username)", "(passwd)",
+         {"rinkou":GlobalSearchTimeline("#rinkou")}]
+       ]).main()

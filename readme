@@ -3,18 +3,6 @@
 == CONFIGURE ==
 * username : your account name
 * password : your password
-* hidden : list of names whose tweets you don't want to see :)
-* group_predicates : set of predicates that define 'group'    
-    These predicates take 'tweet' and should return boolean value.
-    'tweet' is a dictionary data and its keys are:
-    id, screen_name, text, created_at and user_id.
-    The key 'text' is the main contents of the tweet.
-
-    For example, if you want a group that contains all the posts, add
-      "all":(lambda tweet: True)
-    to the set 'group_predicates'.
-    or if you want to watch the post refering you, add
-      "reply":(lambda tweet: "(@yourname)" in tweet["text"])
 
 == COMMAND ==
 * To post the tweet:
